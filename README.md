@@ -35,19 +35,19 @@ You can change the data_name argument to "svamp", "gsm-hard", or "multi-arith" t
 
 To probe and visualize latent thoughts on GSM8K, run:
 ```
-bash script/probe_latent_token.sh
+bash scripts/probe_latent_token.sh
 ```
 The output file will be saved in outputs/.
 
 ## Training
 **GSM8k-Aug**
 ```
-bash script/train_gpt2_gsm8k-aug.sh # or train_llama1b_gsm8k-aug.sh
+bash scripts/train_gpt2_gsm8k-aug.sh # or train_llama1b_gsm8k-aug.sh
 ```
 
 **GSM8k-Aug-NL**
 ```
-bash script/train_gpt2_gsm8k-aug-nl.sh
+bash scripts/train_gpt2_gsm8k-aug-nl.sh
 ```
 
 **Commonsense**
