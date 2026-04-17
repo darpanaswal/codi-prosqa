@@ -10,13 +10,17 @@ import torch
 import json
 import transformers
 from torch.utils.data import Dataset
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from safetensors.torch import load_file
 from tqdm import tqdm
 from math import ceil
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 from datasets import load_dataset
 from functools import partial
+from src.config import wandb_token
+
+import wandb
+wandb.login(key=wandb_token)
 
 from src.model import (
     CODI,
@@ -60,6 +64,123 @@ class CustomTrainer(Trainer):
         if self.state.global_step is not None:
             for k, v in logs.items():
                 super().log({k: v})
+
+
+class ProsQAValCallback(TrainerCallback):
+    """Runs greedy inference on ProsQA val set at the end of each epoch and logs accuracy."""
+
+    def __init__(self, val_path, tokenizer, training_args, model_ref):
+        with open(val_path) as f:
+            val_data = json.load(f)
+        self.val_questions = [d["question"].strip() for d in val_data]
+        self.val_answers = [d["answer"].replace(",", "").strip() for d in val_data]
+        self.tokenizer = tokenizer
+        self.training_args = training_args
+        self.model_ref = model_ref  # reference to the CODI module
+        self.num_latent = training_args.num_latent
+        self.use_prj = training_args.use_prj
+        self.remove_eos = training_args.remove_eos
+
+    @torch.no_grad()
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            model = self.model_ref
+        model.eval()
+        device = next(model.parameters()).device
+        tokenizer = self.tokenizer
+
+        # Match training precision (bf16 if enabled, else fp16 if enabled, else fp32)
+        if args.bf16:
+            autocast_dtype = torch.bfloat16
+        elif args.fp16:
+            autocast_dtype = torch.float16
+        else:
+            autocast_dtype = torch.float32
+
+        correct = 0
+        total = len(self.val_questions)
+        batch_size = 64
+
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=(autocast_dtype != torch.float32)):
+            for start in range(0, total, batch_size):
+                end = min(start + batch_size, total)
+                batch_questions = self.val_questions[start:end]
+                batch_answers = self.val_answers[start:end]
+                bs = len(batch_questions)
+
+                batch = tokenizer(batch_questions, return_tensors="pt", padding="longest")
+                if self.remove_eos:
+                    bot_tensor = torch.tensor([model.bot_id], dtype=torch.long).expand(bs, 1)
+                else:
+                    bot_tensor = torch.tensor([tokenizer.eos_token_id, model.bot_id], dtype=torch.long).expand(bs, 2)
+                batch["input_ids"] = torch.cat((batch["input_ids"], bot_tensor), dim=1).to(device)
+                batch["attention_mask"] = torch.cat((batch["attention_mask"], torch.ones_like(bot_tensor)), dim=1).to(device)
+
+                # Encode question + bot
+                outputs = model.codi(input_ids=batch["input_ids"], use_cache=True, output_hidden_states=True, attention_mask=batch["attention_mask"])
+                past_key_values = outputs.past_key_values
+                latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+                if self.use_prj:
+                    latent_embd = model.prj(latent_embd)
+
+                # Latent iterations
+                for _ in range(self.num_latent):
+                    outputs = model.codi(inputs_embeds=latent_embd, use_cache=True, output_hidden_states=True, past_key_values=past_key_values)
+                    past_key_values = outputs.past_key_values
+                    latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+                    if self.use_prj:
+                        latent_embd = model.prj(latent_embd)
+
+                # Insert eot
+                if self.remove_eos:
+                    eot_emb = model.get_embd(model.codi, model.model_name)(torch.tensor([model.eot_id], dtype=torch.long, device=device)).unsqueeze(0)
+                else:
+                    eot_emb = model.get_embd(model.codi, model.model_name)(torch.tensor([model.eot_id, tokenizer.eos_token_id], dtype=torch.long, device=device)).unsqueeze(0)
+                eot_emb = eot_emb.expand(bs, -1, -1)
+
+                # Greedy autoregressive decode
+                output_emb = eot_emb
+                finished = torch.zeros(bs, dtype=torch.bool, device=device)
+                pred_tokens = [[] for _ in range(bs)]
+                for _ in range(128):  # max tokens for ProsQA answers
+                    out = model.codi(inputs_embeds=output_emb, use_cache=True, output_hidden_states=False, past_key_values=past_key_values)
+                    past_key_values = out.past_key_values
+                    logits = out.logits[:, -1, :model.codi.config.vocab_size - 1]
+                    next_ids = torch.argmax(logits, dim=-1)
+                    for b in range(bs):
+                        if not finished[b]:
+                            pred_tokens[b].append(next_ids[b].item())
+                            if next_ids[b] == tokenizer.eos_token_id:
+                                finished[b] = True
+                    if finished.all():
+                        break
+                    output_emb = model.get_embd(model.codi, model.model_name)(next_ids).unsqueeze(1).to(device)
+
+                # Score
+                for b in range(bs):
+                    decoded = tokenizer.decode(pred_tokens[b], skip_special_tokens=True)
+                    if "The answer is:" in decoded:
+                        pred = decoded.split("The answer is:")[-1].strip().split("\n")[0].strip()
+                        if not pred.endswith("."):
+                            pred += "."
+                    else:
+                        pred = decoded.strip()
+                    if pred == batch_answers[b]:
+                        correct += 1
+
+        val_acc = correct / total
+        print(f"\n[Epoch {state.epoch:.0f}] ProsQA val accuracy: {100 * val_acc:.2f}% ({correct}/{total})\n")
+
+        # Log to wandb/tensorboard via Trainer
+        if state.is_world_process_zero:
+            try:
+                import wandb as _wb
+                if _wb.run is not None:
+                    _wb.log({"val/accuracy": val_acc, "epoch": state.epoch}, step=state.global_step)
+            except Exception:
+                pass
+
+        model.train()
 
 def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
     """Tokenize a list of strings."""
@@ -383,7 +504,9 @@ def train():
             data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
             return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
         elif "prontoqa" in data_args.data_name:
-            with open("/home/ubuntu/coconut/data/prontoqa_train.json") as f:
+            if data_args.data_path is None:
+                raise ValueError("--data_path must be specified for prontoqa/prosqa datasets")
+            with open(data_args.data_path) as f:
                 dataset = json.load(f)
             train_dataset = SupervisedDataset(data_name=data_args.data_name, raw_data=dataset, tokenizer=tokenizer, bot=model.bot_id, eot=model.eot_id)
             data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
@@ -401,7 +524,22 @@ def train():
     )
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = CustomTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+
+    # Set up callbacks
+    callbacks = []
+    if "prontoqa" in data_args.data_name and data_args.val_data_path is not None:
+        val_cb = ProsQAValCallback(
+            val_path=data_args.val_data_path,
+            tokenizer=tokenizer,
+            training_args=training_args,
+            model_ref=model,
+        )
+        callbacks.append(val_cb)
+        logging.warning(f"ProsQA val callback enabled: {data_args.val_data_path}")
+    elif "prontoqa" in data_args.data_name:
+        logging.warning("No --val_data_path provided; skipping validation during training.")
+
+    trainer = CustomTrainer(model=model, tokenizer=tokenizer, args=training_args, callbacks=callbacks, **data_module)
     trainer.train()
 
     # to avoid the error of saving the model

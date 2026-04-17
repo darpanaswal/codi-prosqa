@@ -65,6 +65,15 @@ class DataArguments:
         },
     )
     batch_size: int = field(default=1, metadata={"help": "batch size during inference"})
+    data_path: str = field(
+        default=None, metadata={"help": "Path to training data JSON file (used for prontoqa/prosqa)."}
+    )
+    test_data_path: str = field(
+        default=None, metadata={"help": "Path to test data JSON file (used for prontoqa/prosqa)."}
+    )
+    val_data_path: str = field(
+        default=None, metadata={"help": "Path to validation data JSON file (used for prontoqa/prosqa)."}
+    )
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -407,4 +416,3 @@ class CODI(torch.nn.Module):
             ref_ce_loss = ref_ce_loss.detach().item()
 
         return {"loss": loss, "logits": logits, "ce_loss": ce_loss_total, "distill_loss": distill_loss_total, "ref_ce_loss": ref_ce_loss}
-

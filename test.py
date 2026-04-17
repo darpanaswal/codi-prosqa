@@ -125,39 +125,49 @@ def evaluation(model_args, data_args, training_args):
     elif "gsm8k" == data_args.data_name:
         dataset = load_dataset("gsm8k", "main")
         test_set = dataset['test']
+    elif "prontoqa" in data_args.data_name or "prosqa" in data_args.data_name:
+        if data_args.test_data_path is None:
+            raise ValueError("--test_data_path must be specified for prontoqa/prosqa datasets")
+        with open(data_args.test_data_path) as f:
+            test_data_raw = json.load(f)
+        # Build question and answer lists directly, skip standard loop below
+        question = [d["question"].strip() for d in test_data_raw]
+        answer = [d["answer"].replace(",", "").strip() for d in test_data_raw]
     else:
         raise NotImplementedError
 
     logging.warning("Formatting inputs...")
-    question = [f"{example[question_name].strip().replace('  ', ' ')}" for example in test_set]
-    answer = []
+    is_prosqa = "prontoqa" in data_args.data_name or "prosqa" in data_args.data_name
+    if not is_prosqa:
+        question = [f"{example[question_name].strip().replace('  ', ' ')}" for example in test_set]
+        answer = []
 
-    # get numerical answer
-    for example in test_set:
-        example = example[answer_name]
-        if isinstance(example, bool):
-            answer.append(example)
-            continue
-        if example in ["True", "False"]:
-            if example == "True":
-                ans = True
+        # get numerical answer
+        for example in test_set:
+            example = example[answer_name]
+            if isinstance(example, bool):
+                answer.append(example)
+                continue
+            if example in ["True", "False"]:
+                if example == "True":
+                    ans = True
+                else:
+                    ans = False
+                answer.append(ans)
+                continue
+            if example in "ABCDE":
+                answer.append(example)
+                continue
+            if "####" in example:
+                ans = example.split('####')[-1]
             else:
-                ans = False
+                ans = example
+            ans = ans.replace(',', '')  # handle numbers like 2,000
+            try:
+                ans = float(ans)
+            except ValueError:
+                ans = float("inf")
             answer.append(ans)
-            continue
-        if example in "ABCDE":
-            answer.append(example)
-            continue
-        if "####" in example:
-            ans = example.split('####')[-1]
-        else:
-            ans = example
-        ans = ans.replace(',', '')  # handle numbers like 2,000
-        try:
-            ans = float(ans)
-        except ValueError:
-            ans = float("inf")
-        answer.append(ans)
 
     logging.warning("Tokenizing inputs...")
     eval_step = math.ceil(len(question)/data_args.batch_size)
@@ -310,13 +320,28 @@ def evaluation(model_args, data_args, training_args):
       
     accuracy = compute_accuracy(answer, ans_pred_list)
 
-    print(f"adapter: {model_args.adapter_name_or_path} | GSM8K test accuracy: {100*accuracy:.2f}% | ")
+    print(f"adapter: {model_args.adapter_name_or_path} | {data_args.data_name} test accuracy: {100*accuracy:.2f}% | ")
     print(f"average length of COT: {sum(len_cot)/len(len_cot)}")
 
     return 100*accuracy
 
 def extract_answer_number(sentence: str) -> float:
     sentence = sentence.replace(',', '')
+
+    # ProsQA: extract string answer after "The answer is:"
+    if "prontoqa" in data_args.data_name or "prosqa" in data_args.data_name:
+        if "The answer is:" in sentence:
+            ans = sentence.split("The answer is:")[-1].strip()
+            # Remove trailing EOS artifacts, period normalization
+            ans = ans.split("\n")[0].strip()
+            if not ans.endswith("."):
+                ans = ans + "."
+            return ans
+        else:
+            # Fallback: try to find entity answer pattern "X is a Y."
+            # Return raw sentence stripped as last resort
+            return sentence.strip()
+
     pred = [s for s in re.findall(r'-?\d+\.?\d*', sentence)]
     if not pred:
         if "commonsense" in data_args.data_name:
@@ -324,7 +349,7 @@ def extract_answer_number(sentence: str) -> float:
             if pred[0] not in "ABCDE":
                 return "C" 
             return pred[0]
-        elif "strategy" in data_args.data_name or "prontoqa" in data_args.data_name.lower():
+        elif "strategy" in data_args.data_name:
             if "True" in sentence:
                 return True
             elif "False" in sentence:
