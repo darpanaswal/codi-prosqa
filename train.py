@@ -17,10 +17,12 @@ from math import ceil
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 from datasets import load_dataset
 from functools import partial
-from src.config import wandb_token
 
-import wandb
-wandb.login(key=wandb_token)
+try:
+    import wandb
+    wandb.login()
+except ImportError:
+    pass
 
 from src.model import (
     CODI,
@@ -67,45 +69,44 @@ class CustomTrainer(Trainer):
 
 
 class ProsQAValCallback(TrainerCallback):
-    """Runs greedy inference on ProsQA val set at the end of each epoch and logs accuracy."""
+    """Runs greedy inference on ProsQA val and test sets at the end of each epoch."""
 
-    def __init__(self, val_path, tokenizer, training_args, model_ref):
+    def __init__(self, val_path, test_path, tokenizer, training_args, model_ref):
+        self.tokenizer = tokenizer
+        self.training_args = training_args
+        self.model_ref = model_ref
+        self.num_latent = training_args.num_latent
+        self.use_prj = training_args.use_prj
+        self.remove_eos = training_args.remove_eos
+        self.trainer = None  # set after trainer is created
+
+        # Load val set
         with open(val_path) as f:
             val_data = json.load(f)
         self.val_questions = [d["question"].strip() for d in val_data]
         self.val_answers = [d["answer"].replace(",", "").strip() for d in val_data]
-        self.tokenizer = tokenizer
-        self.training_args = training_args
-        self.model_ref = model_ref  # reference to the CODI module
-        self.num_latent = training_args.num_latent
-        self.use_prj = training_args.use_prj
-        self.remove_eos = training_args.remove_eos
 
-    @torch.no_grad()
-    def on_epoch_end(self, args, state, control, model=None, **kwargs):
-        if model is None:
-            model = self.model_ref
-        model.eval()
-        device = next(model.parameters()).device
+        # Load test set (optional)
+        self.test_questions = None
+        self.test_answers = None
+        if test_path is not None:
+            with open(test_path) as f:
+                test_data = json.load(f)
+            self.test_questions = [d["question"].strip() for d in test_data]
+            self.test_answers = [d["answer"].replace(",", "").strip() for d in test_data]
+
+    def _evaluate_split(self, model, questions, answers, device, autocast_dtype):
+        """Run greedy inference and return accuracy."""
         tokenizer = self.tokenizer
-
-        # Match training precision (bf16 if enabled, else fp16 if enabled, else fp32)
-        if args.bf16:
-            autocast_dtype = torch.bfloat16
-        elif args.fp16:
-            autocast_dtype = torch.float16
-        else:
-            autocast_dtype = torch.float32
-
         correct = 0
-        total = len(self.val_questions)
+        total = len(questions)
         batch_size = 64
 
         with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=(autocast_dtype != torch.float32)):
             for start in range(0, total, batch_size):
                 end = min(start + batch_size, total)
-                batch_questions = self.val_questions[start:end]
-                batch_answers = self.val_answers[start:end]
+                batch_questions = questions[start:end]
+                batch_answers = answers[start:end]
                 bs = len(batch_questions)
 
                 batch = tokenizer(batch_questions, return_tensors="pt", padding="longest")
@@ -142,7 +143,7 @@ class ProsQAValCallback(TrainerCallback):
                 output_emb = eot_emb
                 finished = torch.zeros(bs, dtype=torch.bool, device=device)
                 pred_tokens = [[] for _ in range(bs)]
-                for _ in range(128):  # max tokens for ProsQA answers
+                for _ in range(128):
                     out = model.codi(inputs_embeds=output_emb, use_cache=True, output_hidden_states=False, past_key_values=past_key_values)
                     past_key_values = out.past_key_values
                     logits = out.logits[:, -1, :model.codi.config.vocab_size - 1]
@@ -168,17 +169,38 @@ class ProsQAValCallback(TrainerCallback):
                     if pred == batch_answers[b]:
                         correct += 1
 
-        val_acc = correct / total
-        print(f"\n[Epoch {state.epoch:.0f}] ProsQA val accuracy: {100 * val_acc:.2f}% ({correct}/{total})\n")
+        return correct / total
 
-        # Log to wandb/tensorboard via Trainer
-        if state.is_world_process_zero:
-            try:
-                import wandb as _wb
-                if _wb.run is not None:
-                    _wb.log({"val/accuracy": val_acc, "epoch": state.epoch}, step=state.global_step)
-            except Exception:
-                pass
+    @torch.no_grad()
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            model = self.model_ref
+        model.eval()
+        device = next(model.parameters()).device
+
+        if args.bf16:
+            autocast_dtype = torch.bfloat16
+        elif args.fp16:
+            autocast_dtype = torch.float16
+        else:
+            autocast_dtype = torch.float32
+
+        # Val
+        val_acc = self._evaluate_split(model, self.val_questions, self.val_answers, device, autocast_dtype)
+        print(f"\n[Epoch {state.epoch:.0f}] val accuracy: {100 * val_acc:.2f}% ({int(val_acc * len(self.val_questions))}/{len(self.val_questions)})")
+
+        # Test
+        test_acc = None
+        if self.test_questions is not None:
+            test_acc = self._evaluate_split(model, self.test_questions, self.test_answers, device, autocast_dtype)
+            print(f"[Epoch {state.epoch:.0f}] test accuracy: {100 * test_acc:.2f}% ({int(test_acc * len(self.test_questions))}/{len(self.test_questions)})\n")
+
+        # Log through the Trainer
+        if self.trainer is not None and state.is_world_process_zero:
+            metrics = {"val/accuracy": val_acc}
+            if test_acc is not None:
+                metrics["test/accuracy"] = test_acc
+            self.trainer.log(metrics)
 
         model.train()
 
@@ -530,16 +552,24 @@ def train():
     if "prontoqa" in data_args.data_name and data_args.val_data_path is not None:
         val_cb = ProsQAValCallback(
             val_path=data_args.val_data_path,
+            test_path=data_args.test_data_path,  # None is fine, test eval will be skipped
             tokenizer=tokenizer,
             training_args=training_args,
             model_ref=model,
         )
         callbacks.append(val_cb)
         logging.warning(f"ProsQA val callback enabled: {data_args.val_data_path}")
+        if data_args.test_data_path:
+            logging.warning(f"ProsQA test callback enabled: {data_args.test_data_path}")
     elif "prontoqa" in data_args.data_name:
         logging.warning("No --val_data_path provided; skipping validation during training.")
 
     trainer = CustomTrainer(model=model, tokenizer=tokenizer, args=training_args, callbacks=callbacks, **data_module)
+
+    # Give the val callback a reference to the trainer for logging
+    if "prontoqa" in data_args.data_name and data_args.val_data_path is not None:
+        val_cb.trainer = trainer
+
     trainer.train()
 
     # to avoid the error of saving the model
