@@ -25,8 +25,8 @@ torchrun --nnodes 1 --nproc_per_node 1 train.py \
     --per_device_train_batch_size 64 \
     --gradient_accumulation_steps 2 \
     --bf16 \
-    --num_train_epochs 100 \
-    --learning_rate 5e-4 \
+    --num_train_epochs 20 \
+    --learning_rate 1e-3 \
     --max_grad_norm 2.0 \
     --use_lora True \
     --lora_r 128 --lora_alpha 32 --lora_init \

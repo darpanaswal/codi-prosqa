@@ -26,7 +26,7 @@ python -u test.py \
     --prj_dim 768 \
     --prj_no_ln False \
     --prj_dropout 0.0 \
-    --inf_latent_iterations 5 \
+    --inf_latent_iterations 6 \
     --inf_num_iterations 1 \
     --remove_eos True \
     --use_lora True \
