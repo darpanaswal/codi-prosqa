@@ -22,6 +22,23 @@ import copy
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+# POS-FIX: helper to build absolute position_ids that anchor real tokens to start at 0,
+# regardless of padding side or padding length. This is the HF-standard recipe.
+def build_position_ids_from_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    attention_mask: [B, L] with 1 for real tokens, 0 for padding.
+    Returns position_ids: [B, L] where the first real token in each row is at position 0,
+    subsequent real tokens increment by 1, and padding positions are filled with 1
+    (harmless because the attention mask zeros out their contribution; we avoid 0 so
+    we don't accidentally duplicate the first real token's position embedding if the
+    mask is ever dropped downstream).
+    """
+    mask = attention_mask.long()
+    position_ids = mask.cumsum(dim=-1) - 1
+    position_ids.masked_fill_(mask == 0, 1)
+    return position_ids
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(default="mistralai/Mistral-7B-Instruct-v0.2")
@@ -125,6 +142,7 @@ class TrainingArguments(transformers.TrainingArguments):
     print_loss: bool = field(default=True)
     max_token_num: int = field(default=1000, metadata={"help": "Limit the longest data to avoid OOM."})
 
+
 def print_trainable_parameters(model):
     trainable_parameters = 0
     all_param = 0
@@ -135,14 +153,12 @@ def print_trainable_parameters(model):
     print(
         f"trainable params: {trainable_parameters} || all params: {all_param} || trainable%: {100 * trainable_parameters / all_param}"
     )
-    # for name, param in model.named_parameters():
-    #     if param.requires_grad:
-    #         print(name, param.shape)
 
 
 def freeze_model(model):
     for _, param in model.named_parameters():
         param.requires_grad = False
+
 
 class CODI(torch.nn.Module):
     def __init__(self, model_args, training_args, lora_config):
@@ -282,30 +298,61 @@ class CODI(torch.nn.Module):
         step: int = None,
         step_ratio: float = None
     ):
-        if not self.fix_attn_mask:
-            ref_attention_mask = None
+        # POS-FIX (point 4): always feed an explicit attention mask to the ref pass so
+        # train/eval are identical regardless of fix_attn_mask flag history. The ref
+        # path uses right-padding in this codebase, but being explicit costs nothing.
+        if ref_attention_mask is None:
+            ref_attention_mask = ref_input_ids.ne(self.pad_token_id).long()
+        # POS-FIX (point 1): explicit position_ids for the ref (teacher) pass.
+        ref_position_ids = build_position_ids_from_mask(ref_attention_mask)
         
+        # POS-FIX (point 1): explicit position_ids for the encoder pass.
+        # encoder_attention_mask is already supplied by the collator.
+        encoder_position_ids = build_position_ids_from_mask(encoder_attention_mask)
+
         # Encode the question
         past_key_values = None
-        outputs = self.codi(input_ids=encoder_input_ids, use_cache=True, output_hidden_states=True, past_key_values=past_key_values, attention_mask=encoder_attention_mask)
+        outputs = self.codi(
+            input_ids=encoder_input_ids,
+            use_cache=True,
+            output_hidden_states=True,
+            past_key_values=past_key_values,
+            attention_mask=encoder_attention_mask,
+            position_ids=encoder_position_ids,  # POS-FIX
+        )
         past_key_values = outputs.past_key_values
         latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1) # as the next input
         if self.use_prj:
             latent_embd = self.prj(latent_embd)
 
+        # POS-FIX (point 2): initialize the running mask and position tracker.
+        # The running mask starts as the encoder mask and grows by 1 per forward pass.
+        # current_position is per-row: it equals the position ID of the *last* real
+        # token that was just consumed, and we feed (current_position + 1) next.
+        running_mask = encoder_attention_mask.clone()
+        # Per-row last position index (position of the bot_id we just consumed).
+        current_position = encoder_position_ids[:, -1]  # shape [B]
+
         len_pred_loss = 0
-        dynamic_mask = None
-        if self.fix_attn_mask:
-            dynamic_mask = torch.ones((encoder_attention_mask.size(0), self.num_latent), device=ref_labels.device)
 
         # Iterate over the latent embeddings
         distill_loss_total = 0
         ce_loss_total = 0
 
         with torch.no_grad():
-            ref_outputs = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
-        ref_outputs_with_grad = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask) 
-        
+            ref_outputs = self.codi(
+                input_ids=ref_input_ids,
+                output_hidden_states=True,
+                attention_mask=ref_attention_mask,
+                position_ids=ref_position_ids,  # POS-FIX
+            )
+        ref_outputs_with_grad = self.codi(
+            input_ids=ref_input_ids,
+            output_hidden_states=True,
+            attention_mask=ref_attention_mask,
+            position_ids=ref_position_ids,  # POS-FIX
+        )
+
         # Formatting for deprecated exps
         ref_outputs_list = [ref_outputs] 
         ref_input_ids = [ref_input_ids] 
@@ -319,7 +366,6 @@ class CODI(torch.nn.Module):
         # For DEBUG: Print the probability of the teacher task to predict the correct answer
         if self.training_args.print_ref_model_stats:
             for i, (ref_inputs, ref_outputs) in enumerate(zip(ref_input_ids, ref_outputs_list)):
-                # evalutae the reference model
                 if len(ref_outputs_list) > 1:
                     pos = ref_answer_position[i]
                 else:
@@ -339,8 +385,25 @@ class CODI(torch.nn.Module):
         num_latent = self.num_latent
         if self.num_latent != 0:
             for i in range(num_latent):
+                # POS-FIX (point 2): advance position and extend mask before each latent step.
+                current_position = current_position + 1  # [B]
+                running_mask = torch.cat(
+                    [running_mask, torch.ones((running_mask.size(0), 1),
+                                              dtype=running_mask.dtype,
+                                              device=running_mask.device)],
+                    dim=1,
+                )
+                latent_position_ids = current_position.unsqueeze(1)  # [B, 1]
+
                 # Implicit CoT generation
-                outputs = self.codi(inputs_embeds=latent_embd, use_cache=True, output_hidden_states=True, past_key_values=past_key_values)
+                outputs = self.codi(
+                    inputs_embeds=latent_embd,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    past_key_values=past_key_values,
+                    attention_mask=running_mask,           # POS-FIX
+                    position_ids=latent_position_ids,      # POS-FIX
+                )
                 past_key_values = outputs.past_key_values
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
                 if self.use_prj:
@@ -350,16 +413,32 @@ class CODI(torch.nn.Module):
                 if i == num_latent - 1: # the last latent embedding
                     # Decode the final answer in natural language
                     embds = self.get_embd(self.codi, self.model_name)(decoder_input_ids)
-                  
-                    if dynamic_mask is not None: # Prevent attending the paddings
-                        decoder_mask = torch.ones((embds.size(0), embds.size(1)), dtype=torch.bool).to(dynamic_mask)
-                        dynamic_mask = torch.cat((encoder_attention_mask, dynamic_mask, decoder_mask), dim=1)
-                        dynamic_mask = dynamic_mask.bool()
+
+                    # POS-FIX (point 3): build the decoder mask and decoder position IDs
+                    # that continue from where the latent loop ended. decoder_input_ids is
+                    # right-padded (or has no pad); treat all non-pad positions as real.
+                    decoder_real_mask = decoder_input_ids.ne(self.pad_token_id).long()
+                    # Final decoder mask = running_mask concatenated with the decoder's own mask.
+                    final_mask = torch.cat([running_mask, decoder_real_mask], dim=1)
+                    # Decoder position IDs start at current_position + 1 and increment.
+                    dec_len = decoder_input_ids.size(1)
+                    dec_arange = torch.arange(1, dec_len + 1, device=decoder_input_ids.device).unsqueeze(0)  # [1, dec_len]
+                    decoder_position_ids = current_position.unsqueeze(1) + dec_arange  # [B, dec_len]
+                    # Where the decoder token is padding, pin position to 1 (harmless; mask zeros it).
+                    decoder_position_ids = decoder_position_ids.masked_fill(decoder_real_mask == 0, 1)
+
                     # Student task's output
-                    outputs = self.codi(inputs_embeds=embds, use_cache=True, output_hidden_states=True, past_key_values=past_key_values, attention_mask=dynamic_mask) 
+                    outputs = self.codi(
+                        inputs_embeds=embds,
+                        use_cache=True,
+                        output_hidden_states=True,
+                        past_key_values=past_key_values,
+                        attention_mask=final_mask,           # POS-FIX
+                        position_ids=decoder_position_ids,   # POS-FIX
+                    )
                     # Teacher task's output
                     ref_outputs = ref_outputs_list[0]
-                    
+
                     distill_loss = 0
                     # Calculate distillation loss between the teacher's logits and the student's logits for every layer
                     for j, (out, ref_out) in enumerate(zip(outputs.hidden_states, ref_outputs.hidden_states)):

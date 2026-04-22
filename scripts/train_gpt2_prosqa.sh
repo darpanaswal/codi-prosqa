@@ -21,8 +21,8 @@ torchrun --nnodes 1 --nproc_per_node 1 train.py \
     --val_data_path "$VAL_DATA_PATH" \
     --test_data_path "data/prosqa_test.json" \
     --seed 11 \
-    --model_max_length 1024 \
-    --per_device_train_batch_size 64 \
+    --model_max_length 768 \
+    --per_device_train_batch_size 32 \
     --gradient_accumulation_steps 2 \
     --bf16 \
     --num_train_epochs 20 \

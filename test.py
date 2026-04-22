@@ -1,17 +1,3 @@
-#    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
-#
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
-
 import logging
 import math
 import re
@@ -37,6 +23,7 @@ from src.model import (
     ModelArguments,
     DataArguments,
     TrainingArguments,
+    build_position_ids_from_mask,  # POS-FIX: shared helper
 )
 
 do_print = True
@@ -68,15 +55,11 @@ def evaluation(model_args, data_args, training_args):
         raise NotImplementedError
     
     model = CODI(model_args, training_args, lora_config)
-    #if "llama" in model_args.model_name_or_path:
-    #    model.codi.resize_token_embeddings(128261)
     try:
         state_dict = load_file(os.path.join(model_args.ckpt_dir, "model.safetensors"))
     except Exception:
         state_dict = torch.load(os.path.join(model_args.ckpt_dir, "pytorch_model.bin"))
     
-    # new_state_dict = { k.replace("coconut", "codi"): v for k, v in state_dict.items() }
-    # torch.save(new_state_dict, "/scratch/prj/inf_multimodal_qa/scratch_tmp/transfer/pytorch_model.bin")
     model.load_state_dict(state_dict, strict=False)
     model.codi.tie_weights()
     
@@ -130,7 +113,6 @@ def evaluation(model_args, data_args, training_args):
             raise ValueError("--test_data_path must be specified for prontoqa/prosqa datasets")
         with open(data_args.test_data_path) as f:
             test_data_raw = json.load(f)
-        # Build question and answer lists directly, skip standard loop below
         question = [d["question"].strip() for d in test_data_raw]
         answer = [d["answer"].replace(",", "").strip() for d in test_data_raw]
     else:
@@ -142,7 +124,6 @@ def evaluation(model_args, data_args, training_args):
         question = [f"{example[question_name].strip().replace('  ', ' ')}" for example in test_set]
         answer = []
 
-        # get numerical answer
         for example in test_set:
             example = example[answer_name]
             if isinstance(example, bool):
@@ -162,7 +143,7 @@ def evaluation(model_args, data_args, training_args):
                 ans = example.split('####')[-1]
             else:
                 ans = example
-            ans = ans.replace(',', '')  # handle numbers like 2,000
+            ans = ans.replace(',', '')
             try:
                 ans = float(ans)
             except ValueError:
@@ -208,32 +189,59 @@ def evaluation(model_args, data_args, training_args):
     }
 
     ans_pred_list = []
-    ans_pred_list_accu_at_n_passes = []
-    attention_map_weights = []
-    attention_to_latents_against_len_sum = []
-    attention_to_latents_against_len_count = []
-    #set_seed(42)
-    gating_probs_sums = None
     len_cot = []
     model.eval()
-    attn_to_latent_list = []
     
     for step, batch in enumerate(question_data):
         batch_size = batch["input_ids"].size(0)
         with torch.no_grad():
+            # POS-FIX (point 1): build explicit position_ids from the (left-padded) mask
+            # so the first real token is always at position 0 and bot_id lands on a
+            # deterministic position regardless of padding length.
+            encoder_position_ids = build_position_ids_from_mask(batch["attention_mask"])
+
             # encode the question
             past_key_values = None
-            outputs = model.codi(input_ids=batch["input_ids"], use_cache=True, output_hidden_states=True, past_key_values=past_key_values, attention_mask=batch["attention_mask"])
+            outputs = model.codi(
+                input_ids=batch["input_ids"],
+                use_cache=True,
+                output_hidden_states=True,
+                past_key_values=past_key_values,
+                attention_mask=batch["attention_mask"],
+                position_ids=encoder_position_ids,   # POS-FIX
+            )
             past_key_values = outputs.past_key_values
             latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
 
             if training_args.use_prj:
                 latent_embd = model.prj(latent_embd)
-            
+
+            # POS-FIX (point 2): start the running mask and per-row position tracker
+            # from the encoder state. These will be extended through the entire
+            # latent loop and then through the decode loop (point 3).
+            running_mask = batch["attention_mask"].clone()
+            current_position = encoder_position_ids[:, -1]  # [B], position of bot_id
+
             inf_latent_iterations = training_args.inf_latent_iterations
             for i in range(inf_latent_iterations):
-                # decode the latent embeddings
-                outputs = model.codi(inputs_embeds=latent_embd, use_cache=True, output_hidden_states=True, past_key_values=past_key_values)
+                # POS-FIX (point 2): advance position, extend mask by one.
+                current_position = current_position + 1
+                running_mask = torch.cat(
+                    [running_mask, torch.ones((running_mask.size(0), 1),
+                                              dtype=running_mask.dtype,
+                                              device=running_mask.device)],
+                    dim=1,
+                )
+                latent_position_ids = current_position.unsqueeze(1)  # [B, 1]
+
+                outputs = model.codi(
+                    inputs_embeds=latent_embd,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    past_key_values=past_key_values,
+                    attention_mask=running_mask,           # POS-FIX
+                    position_ids=latent_position_ids,      # POS-FIX
+                )
                 past_key_values = outputs.past_key_values
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
                 
@@ -248,9 +256,23 @@ def evaluation(model_args, data_args, training_args):
             eot_emb = eot_emb.expand(batch["input_ids"].size(0), -1, -1)
 
             output = eot_emb
-            
+            eot_len = output.size(1)  # 1 or 2 depending on remove_eos
+
+            # POS-FIX (point 3): carry running_mask and position tracker into decode.
+            # First, extend for the eot embedding(s) that we're about to feed.
+            eot_position_ids = (current_position.unsqueeze(1)
+                                + torch.arange(1, eot_len + 1, device=device).unsqueeze(0))  # [B, eot_len]
+            running_mask = torch.cat(
+                [running_mask,
+                 torch.ones((running_mask.size(0), eot_len),
+                            dtype=running_mask.dtype, device=running_mask.device)],
+                dim=1,
+            )
+            current_position = current_position + eot_len
+            current_step_position_ids = eot_position_ids
+
             seq_len = 0
-            finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda")  # Track EOS for each sequence
+            finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
             pred_tokens = [[] for _ in range(batch_size)]
             for i in range(gen_kwargs["max_new_tokens"]):
                 seq_len += 1
@@ -258,7 +280,8 @@ def evaluation(model_args, data_args, training_args):
                 out = model.codi(
                         inputs_embeds=output,
                         output_hidden_states=False,
-                        attention_mask=None,
+                        attention_mask=running_mask,              # POS-FIX (point 3)
+                        position_ids=current_step_position_ids,   # POS-FIX (point 3)
                         use_cache=True,
                         output_attentions=False,
                         past_key_values=past_key_values
@@ -266,9 +289,9 @@ def evaluation(model_args, data_args, training_args):
                 past_key_values = out.past_key_values
                 logits = out.logits[:, -1, :model.codi.config.vocab_size-1]
 
-                # implement the sampling process
+                # sampling
                 if training_args.greedy:
-                    next_token_ids = torch.argmax(logits, dim=-1).squeeze(-1)
+                    next_token_ids = torch.argmax(logits, dim=-1)
                 else:
                     logits /= gen_kwargs["temperature"]
                     if gen_kwargs["top_k"] > 1:
@@ -291,24 +314,30 @@ def evaluation(model_args, data_args, training_args):
                     probs = F.softmax(logits, dim=-1)
                     next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-                # Handle EOS for each sequence
                 for b in range(batch_size):
                     if not finished[b]:
                         pred_tokens[b].append(next_token_ids[b].item())
                         if next_token_ids[b] == tokenizer.eos_token_id:
                             finished[b] = True
 
-                # Break if all sequences have finished
                 if finished.all():
                     break
 
-                #output = model.codi.get_base_model().transformer.wte(next_token_ids).unsqueeze(1).to(device)
                 output = model.get_embd(model.codi, model.model_name)(next_token_ids).unsqueeze(1).to(device)
+
+                # POS-FIX (point 3): advance mask + position for the next single-token step.
+                current_position = current_position + 1
+                current_step_position_ids = current_position.unsqueeze(1)  # [B, 1]
+                running_mask = torch.cat(
+                    [running_mask,
+                     torch.ones((running_mask.size(0), 1),
+                                dtype=running_mask.dtype, device=running_mask.device)],
+                    dim=1,
+                )
 
             for mini_step, pred_token in enumerate(pred_tokens):
                 len_cot.append(len(pred_token))
                 decoded_pred = tokenizer.decode(pred_token, skip_special_tokens=True)
-                # Extract the numbers in sentences 
                 if do_print:
                     print(f"Question {step*data_args.batch_size+mini_step} Starts...")
                     print(f"Q: {question[step*data_args.batch_size+mini_step]}")
@@ -325,6 +354,7 @@ def evaluation(model_args, data_args, training_args):
 
     return 100*accuracy
 
+
 def extract_answer_number(sentence: str) -> float:
     sentence = sentence.replace(',', '')
 
@@ -332,14 +362,11 @@ def extract_answer_number(sentence: str) -> float:
     if "prontoqa" in data_args.data_name or "prosqa" in data_args.data_name:
         if "The answer is:" in sentence:
             ans = sentence.split("The answer is:")[-1].strip()
-            # Remove trailing EOS artifacts, period normalization
             ans = ans.split("\n")[0].strip()
             if not ans.endswith("."):
                 ans = ans + "."
             return ans
         else:
-            # Fallback: try to find entity answer pattern "X is a Y."
-            # Return raw sentence stripped as last resort
             return sentence.strip()
 
     pred = [s for s in re.findall(r'-?\d+\.?\d*', sentence)]
@@ -358,9 +385,7 @@ def extract_answer_number(sentence: str) -> float:
                 raise ValueError
         return float('inf')
 
-    # use the last number as the answer
     pred_answer = float(pred[-1])
-
     return pred_answer
 
 

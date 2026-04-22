@@ -6,7 +6,7 @@ source codi/bin/activate
 # NOTE: Update CKPT_DIR and TEST_DATA_PATH before running.
 
 # --- PATHS (edit these) ---
-CKPT_DIR="model/prosqa/codi/prosqa_gpt2_codi/gpt2/ep_20/lr_0.001/seed_11/checkpoint-2800"
+CKPT_DIR="/home/getalp/aswald/codi/model/prosqa/codi/checkpoint-18/checkpoint-best"
 TEST_DATA_PATH="data/prosqa_test.json"
 # --------------------------
 
@@ -16,7 +16,7 @@ python -u test.py \
     --output_dir "." \
     --model_name_or_path model/gpt2 \
     --seed 11 \
-    --model_max_length 512 \
+    --model_max_length 1024 \
     --bf16 \
     --lora_r 128 --lora_alpha 32 --lora_init \
     --batch_size 1 \

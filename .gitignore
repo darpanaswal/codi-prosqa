@@ -4,3 +4,4 @@ codi
 .env
 model
 .vscode
+__pycache__
